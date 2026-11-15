@@ -22,8 +22,21 @@ class ActionManager: NSObject {
 
     @objc static let shared = ActionManager()
 
-    var translateService = BuiltInAIService()
     var polishService = PolishingService()
+
+    /// Global action choices reuse configured instances independently of window enablement.
+    var translateAndReplaceServiceIDs: [String] {
+        let identifiers = [ServiceType.builtInAI.rawValue] +
+            [EZWindowType.main, .fixed, .mini].flatMap { LocalStorage.shared().allServiceTypes($0) }
+        var seen = Set<String>()
+        return identifiers.filter { identifier in
+            guard seen.insert(identifier).inserted,
+                  let service = QueryServiceFactory.shared.service(withTypeId: identifier),
+                  !(service is AIToolService)
+            else { return false }
+            return service.supportedQueryType().contains(.translation)
+        }
+    }
 
     // MARK: - Text Field Detection and Access
 
@@ -74,15 +87,15 @@ class ActionManager: NSObject {
             return
         }
 
-        // Execute the streaming service
-        await performStreamingService(request: request, elementInfo: elementInfo)
+        // Execute the selected service.
+        await performTranslationService(request: request, elementInfo: elementInfo, type: type)
     }
 
     // MARK: - Helper Methods
 
     /// Prepare translation request from text field information
     /// - Parameters:
-    ///   - elementInfo: Information about the current focused element
+    ///   - queryText: Selected or focused text to translate or polish.
     ///   - type: The type of processing (translate or polish)
     /// - Returns: A configured TranslationRequest or nil if preparation fails
     private func prepareTranslationRequest(
@@ -111,7 +124,12 @@ class ActionManager: NSObject {
         // Set service type based on processing type
         switch type {
         case .translate:
-            request.serviceType = translateService.serviceType().rawValue
+            let identifier = Defaults[.translateAndReplaceServiceID]
+            guard translateAndReplaceServiceIDs.contains(identifier) else {
+                await showTranslationReplacementFailure()
+                return nil
+            }
+            request.serviceType = identifier
         case .polish:
             request.serviceType = polishService.serviceType().rawValue
         }
@@ -121,10 +139,11 @@ class ActionManager: NSObject {
 
     // MARK: - Streaming Service Methods
 
-    /// Perform translation or polishing using a streaming service
-    private func performStreamingService(
+    /// Reuses the same insertion path for streaming and complete translation results.
+    private func performTranslationService(
         request: TranslationRequest,
-        elementInfo: FocusedElementInfo
+        elementInfo: FocusedElementInfo,
+        type: ProcessingType
     ) async {
         guard let service = QueryServiceFactory.shared.service(withTypeId: request.serviceType)
         else {
@@ -132,23 +151,33 @@ class ActionManager: NSObject {
             return
         }
 
-        guard let streamService = service as? StreamService else {
-            logError("\(service.name()) does not support streaming")
-            return
-        }
-
-        logInfo("Using model: \(streamService.model)")
-
         do {
             try Task.checkCancellation()
-            let contentStream = try await streamService.contentStreamTranslate(request: request)
+            let contentStream: AsyncThrowingStream<String, Error>
+            if let streamService = service as? StreamService {
+                logInfo("Using model: \(streamService.model)")
+                contentStream = try await streamService.contentStreamTranslate(request: request)
+            } else {
+                let result = try await service.translate(request: request)
+                if let error = result.error { throw error }
+                guard let text = result.translatedText,
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { throw QueryError(type: .noResult) }
+                contentStream = AsyncThrowingStream { continuation in
+                    continuation.yield(text)
+                    continuation.finish()
+                }
+            }
             try Task.checkCancellation()
-            await replaceTextWithStream(contentStream, elementInfo: elementInfo)
+            try await replaceTextWithStream(contentStream, elementInfo: elementInfo)
         } catch {
             if Task.isCancelled {
                 logInfo("Streaming task cancelled")
             } else {
                 logError("stream failed: \(error.localizedDescription)")
+                if type == .translate {
+                    await showTranslationReplacementFailure()
+                }
             }
         }
     }
@@ -158,7 +187,7 @@ class ActionManager: NSObject {
     private func replaceTextWithStream(
         _ contentStream: AsyncThrowingStream<String, Error>,
         elementInfo: FocusedElementInfo
-    ) async {
+    ) async throws {
         logInfo("Replacing text with streaming content")
 
         // For avoding polluting user pasteboard content, we need to save and restore it when AX is not supported.
@@ -168,6 +197,12 @@ class ActionManager: NSObject {
         let isSupportedAX = elementInfo.isSupportedAXElement
         if !isSupportedAX {
             snapshotItems = pasteboard.backupItems()
+        }
+
+        defer {
+            if let snapshotItems, !isSupportedAX {
+                pasteboard.restoreItems(snapshotItems)
+            }
         }
 
         do {
@@ -187,13 +222,16 @@ class ActionManager: NSObject {
                 reuslt += content
                 await systemUtility.insertText(content, using: textStrategy)
             }
+            guard !reuslt.isEmpty else { throw QueryError(type: .noResult) }
             logInfo("Final replacement result: \(reuslt.prettyJSONString)")
         } catch {
             logError("Streaming replacement failed: \(error)")
+            throw error
         }
+    }
 
-        if let snapshotItems, !isSupportedAX {
-            pasteboard.restoreItems(snapshotItems)
-        }
+    @MainActor
+    private func showTranslationReplacementFailure() {
+        EZToast.showText(NSLocalizedString("text_replacement.translation.failed", comment: ""))
     }
 }
