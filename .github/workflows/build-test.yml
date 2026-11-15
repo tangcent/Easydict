@@ -1,0 +1,90 @@
+name: Build and Test
+
+on:
+  push:
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  pull_request:
+    branches: [dev, main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Show build environment
+        run: |
+          xcodebuild -version
+          xcrun swiftc --version
+          sw_vers -productVersion
+
+      - name: Cache Swift package sources
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/swift-package-sources
+          key: verify-swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Easydict.xcworkspace/xcshareddata/swiftpm/Package.resolved', 'BuildTools/Package.resolved') }}
+
+      # Hosted runners have no provisioning profile for the background-inference entitlement.
+      # Override only the CI test host; keep the project entitlement file unchanged.
+      - name: Build and run focused regression tests
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -workspace Easydict.xcworkspace \
+            -scheme Easydict \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -testPlan Default \
+            -parallel-testing-enabled NO \
+            -derivedDataPath "$RUNNER_TEMP/EasydictDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/swift-package-sources" \
+            -resultBundlePath "$RUNNER_TEMP/EasydictTests.xcresult" \
+            -only-testing:EasydictTests/OpenAIStreamTaskControlTests \
+            -only-testing:EasydictTests/ReverseTranslationTests \
+            -only-testing:EasydictTests/LocalizationTests \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_ENTITLEMENTS= \
+            DEVELOPMENT_TEAM= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild-test.log"
+
+      - name: Collect test-launch diagnostics
+        if: failure()
+        run: |
+          codesign -d --entitlements :- "$RUNNER_TEMP/EasydictDerivedData/Build/Products/Debug/Easydict-debug.app" || true
+          /usr/bin/log show --last 5m --style compact --predicate 'process == "amfid" OR process == "taskgated-helper"' > "$RUNNER_TEMP/test-launch.log" || true
+
+      - name: Check build-time formatting did not change sources
+        run: git diff --exit-code
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-test-validation-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/xcodebuild-test.log
+            ${{ runner.temp }}/EasydictTests.xcresult
+            ${{ runner.temp }}/test-launch.log
+          retention-days: 3
+          if-no-files-found: ignore
